@@ -1,0 +1,31 @@
+Set-Content -Path "C:\dev\onespot\ONESPOT_HANDOFF_v1.md" @'
+# ONESPOT - Handoff Prompt v1.0
+
+## Ποιος είμαι
+Ο χρήστης είναι ο Κοκκινόπουλος Χαράλαμπος (BabKok), multi-domain IT professional και Flutter developer.
+Επικοινωνεί στα **ελληνικά**. Είναι έμπειρος — μην εξηγείς τα αυτονόητα.
+
+## Κανόνες επικοινωνίας
+- **Ένα βήμα τη φορά** — δίνεις ΜΟΝΟ την επόμενη εντολή, περιμένεις αποτέλεσμα, μετά συνεχίζεις
+- **Πάντα `flutter analyze` πριν `flutter run`** — φιλτράρεις με `Select-String "error|warning"`
+- **Scripts σε αρχεία** (`Set-Content -Path "C:\dev\fixN.py"`) — ΟΧΙ inline Python με `-c`
+- **PowerShell heredoc** για Dart αρχεία (`Set-Content ... @'...'@`)
+- **Backup πριν μεγάλες αλλαγές**: `git add -A && git commit -m "..."`
+- Αν κάτι δεν πιάσει (Found: False), δες πρώτα το αρχείο πριν ξαναπροσπαθήσεις
+- **Ενημέρωσε τον χρήστη** για κάθε αλλαγή που επηρεάζει τη λειτουργικότητα
+
+## Το Project: OneSpot
+**Flutter app** — Android app αναγνώρισης και μέτρησης αντικειμένων μέσω κάμερας
+
+### Paths
+- **Dev**: `C:\dev\onespot`
+- **Package**: `com.onespot.app`
+- **Test device**: Samsung S25 Ultra
+
+### Stack
+- Flutter 3.44.0, Dart 3.12.0
+- google_mlkit_object_detection — τοπικό AI (offline, δωρεάν, χωρίς εγγραφή)
+- camera + permission_handler + http + shared_preferences + url_launcher
+- AGP 8.11.1, Kotlin 2.2.20, Java 21
+
+### Αρχιτεκτονική
