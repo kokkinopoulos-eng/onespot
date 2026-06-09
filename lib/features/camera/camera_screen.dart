@@ -6,6 +6,7 @@ import 'package:camera/camera.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../../core/services/vision_api_service.dart';
 import '../../core/services/settings_service.dart';
+import '../../core/models/history_entry.dart';
 
 class CameraScreen extends StatefulWidget {
   const CameraScreen({super.key});
@@ -37,7 +38,16 @@ class _CameraScreenState extends State<CameraScreen> {
   // mapping so all three coordinate systems stay in sync.
   Size _previewRenderSize = Size.zero;
   Offset _previewOffset = Offset.zero;
+  // Raw size of the camera Expanded area (the viewport). Combined with the
+  // captured photo's own dimensions to build a cover-fit mapping that stays
+  // correct even when the photo's aspect ratio differs from previewSize.
+  Size _cameraAreaSize = Size.zero;
   final SettingsService _settings = SettingsService();
+  // ── User prompt input (shown after tap, before API call) ──────────────────
+  bool _waitingForUserPrompt = false;
+  Offset? _pendingTapPosition;
+  final TextEditingController _promptController = TextEditingController();
+  // ─────────────────────────────────────────────────────────────────────────
   final Map<int, Offset> _pointers = {};
   Offset? _gestureStart;
   bool _moved = false;
@@ -88,6 +98,9 @@ class _CameraScreenState extends State<CameraScreen> {
   // ── Pointer handlers ──────────────────────────────────────────────────────
 
   void _onPointerDown(PointerDownEvent e) {
+    // While waiting for the user to type a prompt, ignore camera gestures so
+    // taps reach the TextField and Send button instead.
+    if (_waitingForUserPrompt) return;
     debugPrint('ONESPOT: pointer down ${e.pointer} pos=${e.localPosition}');
     _pointers[e.pointer] = e.localPosition;
     if (_pointers.length == 1) {
@@ -136,8 +149,11 @@ class _CameraScreenState extends State<CameraScreen> {
     if (wasTap) {
       final normRect = _selectionRect != null ? _normalizeRect(_selectionRect!) : null;
       if (normRect != null && normRect.contains(upPos)) {
-        setState(() => _dotPosition = upPos);
-        _onTap(upPos);
+        setState(() {
+          _dotPosition = upPos;
+          _pendingTapPosition = upPos;
+          _waitingForUserPrompt = true;
+        });
       } else if (normRect == null) {
         _showToast('Draw a selection rect, then tap inside it');
       } else {
@@ -169,7 +185,7 @@ class _CameraScreenState extends State<CameraScreen> {
 
   // ── Count similar objects ──────────────────────────────────────────────────
 
-  Future<void> _onTap(Offset position) async {
+  Future<void> _onTap(Offset position, {String? userHint}) async {
     if (_isIdentifying) return;
     // Single outer try/catch so NOTHING in the tap path can crash silently —
     // every failure surfaces in the error card and the busy flag is always
@@ -199,66 +215,148 @@ class _CameraScreenState extends State<CameraScreen> {
       setState(() { _isIdentifying = true; _isPaused = true; });
       final image = await _controller!.takePicture();
       final fullBytes = await image.readAsBytes();
-      Uint8List bytes = fullBytes;
 
-      // Crop selection rect to use as the template for similarity search.
-      // _selectionRect is guaranteed non-null here (guarded in _onPointerUp).
-      final normRect = _normalizeRect(_selectionRect!);
+      if (_cameraAreaSize.width == 0 || _cameraAreaSize.height == 0) {
+        setState(() => _lastError = 'Preview not ready — try again');
+        return;
+      }
+      final areaW = _cameraAreaSize.width;
+      final areaH = _cameraAreaSize.height;
+
+      // ── Decode JPEG ──────────────────────────────────────────────────────────
+      ui.Image? rawImg;
       try {
         final codec = await ui.instantiateImageCodec(fullBytes);
-        final frame = await codec.getNextFrame();
-        final img = frame.image;
-        // screen → image coordinate mapping (inverse of bounding-box mapping below):
-        //   imageX = (screenX - offsetX) / previewW * img.width
-        final scaleX = img.width / _previewRenderSize.width;
-        final scaleY = img.height / _previewRenderSize.height;
-        final ox = _previewOffset.dx;
-        final oy = _previewOffset.dy;
-        final srcRect = Rect.fromLTRB(
-          ((normRect.left - ox) * scaleX).clamp(0, img.width.toDouble()),
-          ((normRect.top - oy) * scaleY).clamp(0, img.height.toDouble()),
-          ((normRect.right - ox) * scaleX).clamp(0, img.width.toDouble()),
-          ((normRect.bottom - oy) * scaleY).clamp(0, img.height.toDouble()),
+        rawImg = (await codec.getNextFrame()).image;
+      } catch (_) {}
+      if (rawImg == null) {
+        setState(() => _lastError = 'Could not read photo — try again');
+        return;
+      }
+      double rawW = rawImg.width.toDouble();
+      double rawH = rawImg.height.toDouble();
+
+      // ── Orientation guard ────────────────────────────────────────────────────
+      // Flutter applies EXIF rotation on most devices, but some Android builds
+      // return landscape pixels for a portrait shot. Detect by comparing image
+      // aspect ratio to screen aspect ratio and rotate 90° CW if needed.
+      ui.Image orientedImg = rawImg;
+      double oriW = rawW, oriH = rawH;
+      if ((rawW > rawH) != (areaW > areaH)) {
+        try {
+          final rec = ui.PictureRecorder();
+          final c = Canvas(rec);
+          c.translate(rawH, 0);
+          c.rotate(math.pi / 2);
+          c.drawImage(rawImg, Offset.zero, Paint());
+          orientedImg = await rec.endRecording().toImage(rawH.toInt(), rawW.toInt());
+          oriW = rawH;
+          oriH = rawW;
+        } catch (_) {}
+      }
+
+      // ── Extract viewport image ───────────────────────────────────────────────
+      // The camera preview shows a cover-fit crop of the JPEG. Render exactly
+      // that cropped region to a new image the same size as the screen area.
+      // Result: every pixel in viewportImg maps 1-to-1 to a screen pixel, so
+      // API fractions (0–1) multiply directly by areaW/areaH — no offset math.
+      final coverScale = math.max(areaW / oriW, areaH / oriH);
+      final vpSrcRect = Rect.fromLTWH(
+        ((oriW * coverScale - areaW) / 2) / coverScale,
+        ((oriH * coverScale - areaH) / 2) / coverScale,
+        areaW / coverScale,
+        areaH / coverScale,
+      );
+      final vpDstRect = Rect.fromLTWH(0, 0, areaW, areaH);
+      late ui.Image viewportImg;
+      late Uint8List viewportBytes;
+      try {
+        final rec = ui.PictureRecorder();
+        Canvas(rec).drawImageRect(orientedImg, vpSrcRect, vpDstRect, Paint());
+        viewportImg = await rec.endRecording().toImage(areaW.toInt(), areaH.toInt());
+        final bd = await viewportImg.toByteData(format: ui.ImageByteFormat.png);
+        viewportBytes = bd?.buffer.asUint8List() ?? fullBytes;
+      } catch (_) {
+        setState(() => _lastError = 'Image processing failed — try again');
+        return;
+      }
+
+      // ── Template crop ────────────────────────────────────────────────────────
+      // Crop a region the same size as the selection rect but RE-CENTERED on
+      // the tap point. This gives the model full context (not a tiny patch)
+      // while ensuring the tapped object sits at the CENTER of Image 1, so
+      // the "focus on center" prompt instruction is accurate.
+      final normRect = _normalizeRect(_selectionRect!);
+      final halfW = normRect.width / 2;
+      final halfH = normRect.height / 2;
+      final tapX = position.dx.clamp(0.0, areaW);
+      final tapY = position.dy.clamp(0.0, areaH);
+      Uint8List templateBytes = viewportBytes;
+      try {
+        final src = Rect.fromLTRB(
+          (tapX - halfW).clamp(0.0, areaW),
+          (tapY - halfH).clamp(0.0, areaH),
+          (tapX + halfW).clamp(0.0, areaW),
+          (tapY + halfH).clamp(0.0, areaH),
         );
-        final recorder = ui.PictureRecorder();
-        final canvas = Canvas(recorder);
-        canvas.drawImageRect(img, srcRect, Rect.fromLTWH(0, 0, srcRect.width, srcRect.height), Paint());
-        final cropped = await recorder.endRecording().toImage(srcRect.width.toInt(), srcRect.height.toInt());
-        final byteData = await cropped.toByteData(format: ui.ImageByteFormat.png);
-        if (byteData != null) bytes = byteData.buffer.asUint8List();
+        final rec = ui.PictureRecorder();
+        Canvas(rec).drawImageRect(viewportImg, src,
+            Rect.fromLTWH(0, 0, src.width, src.height), Paint());
+        final tImg = await rec.endRecording().toImage(src.width.toInt(), src.height.toInt());
+        final bd = await tImg.toByteData(format: ui.ImageByteFormat.png);
+        if (bd != null) templateBytes = bd.buffer.asUint8List();
       } catch (_) {}
 
-      final apiService = VisionApiService(
-        provider: apiProvider,
-        apiKey: key,
-      );
-      final boxes = await apiService.findSimilar(bytes, fullBytes);
+      final language = await _settings.getLanguage();
+      final apiService = VisionApiService(provider: apiProvider, apiKey: key);
+      final similar = await apiService.findSimilar(templateBytes, viewportBytes,
+          language: language, userHint: userHint);
 
-      // image fraction (0–1) → screen px:  screenX = fx * previewW + offsetX
-      // Snapshot the preview geometry at tap time — it may change as panels appear/disappear
-      final pw = _previewRenderSize.width;
-      final ph = _previewRenderSize.height;
-      final ox = _previewOffset.dx;
-      final oy = _previewOffset.dy;
-      if (pw == 0 || ph == 0) { setState(() => _lastError = 'Preview not ready — try again'); return; }
-      final rects = boxes.map<Rect>((b) {
-        final fx = (b['x'] as num).toDouble();
-        final fy = (b['y'] as num).toDouble();
-        final fw = (b['w'] as num).toDouble();
-        final fh = (b['h'] as num).toDouble();
-        return Rect.fromLTWH(fx * pw + ox, fy * ph + oy, fw * pw, fh * ph);
+      // ── Map API fractions → screen rects ────────────────────────────────────
+      // Because the API sees viewportImg (same size as screen area), fractions
+      // multiply directly by areaW/areaH — no cover-fit offset needed.
+      // n() safely converts num OR String values from the model JSON.
+      double n(dynamic v) {
+        if (v is num) return v.toDouble();
+        if (v is String) return double.tryParse(v) ?? 0.0;
+        return 0.0;
+      }
+      final rects = similar.items.map<Rect>((b) {
+        if (b.containsKey('x1') && b.containsKey('y1') &&
+            b.containsKey('x2') && b.containsKey('y2')) {
+          return Rect.fromLTRB(
+            n(b['x1']) * areaW, n(b['y1']) * areaH,
+            n(b['x2']) * areaW, n(b['y2']) * areaH,
+          );
+        }
+        final cx = b.containsKey('cx') ? n(b['cx'])
+            : n(b['x']) + n(b['w']) / 2;
+        final cy = b.containsKey('cy') ? n(b['cy'])
+            : n(b['y']) + n(b['h']) / 2;
+        return Rect.fromLTWH(cx * areaW - 24, cy * areaH - 24, 48.0, 48.0);
       }).toList();
 
-      debugPrint('BOXES: ${rects.length}  previewSize=$_previewRenderSize  offset=$_previewOffset');
-      if (boxes.isNotEmpty) debugPrint('BOX_RAW: ${boxes[0]}');
-      if (rects.isNotEmpty) debugPrint('BOX0: fraction=(${boxes[0]['x']},${boxes[0]['y']},${boxes[0]['w']},${boxes[0]['h']}) screen=${rects[0]}');
+      debugPrint('BOXES: ${rects.length} name=${similar.name}  offset=$_previewOffset');
+      final isGeneric = similar.name.isEmpty || similar.name == 'αντικείμενο';
+      final objectName = isGeneric ? 'αντικείμενο' : similar.name;
+      // Greek plural for the generic fallback: 1 αντικείμενο / N αντικείμενα
+      String displayName(int count) {
+        if (isGeneric) return count == 1 ? 'αντικείμενο' : 'αντικείμενα';
+        return objectName;
+      }
       setState(() {
         _isIdentifying = false;
         _boundingBoxes = rects;
-        _counts['Similar'] = rects.length;
-        _toastMsg = 'Found ${rects.length} similar objects';
+        _counts.clear();
+        if (rects.isNotEmpty) _counts[displayName(rects.length)] = rects.length;
+        _toastMsg = rects.isEmpty
+            ? 'Δεν βρέθηκαν αντικείμενα'
+            : '${rects.length} ${displayName(rects.length)}';
         _showingToast = true;
       });
+      if (rects.isNotEmpty) {
+        HistoryService().add('countOne', {'name': displayName(rects.length), 'count': rects.length}, imageBytes: fullBytes);
+      }
       Future.delayed(const Duration(seconds: 5), () {
         if (mounted) setState(() => _showingToast = false);
       });
@@ -272,6 +370,27 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
+  void _submitWithPrompt() {
+    if (!_waitingForUserPrompt) return;
+    final userHint = _promptController.text.trim();
+    _promptController.clear();
+    final pos = _pendingTapPosition;
+    setState(() {
+      _waitingForUserPrompt = false;
+      _pendingTapPosition = null;
+    });
+    if (pos != null) _onTap(pos, userHint: userHint.isEmpty ? null : userHint);
+  }
+
+  void _cancelPrompt() {
+    _promptController.clear();
+    setState(() {
+      _waitingForUserPrompt = false;
+      _pendingTapPosition = null;
+      _dotPosition = null;
+    });
+  }
+
   void _showToast(String msg) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(msg), backgroundColor: const Color(0xFF0F0F1A),
@@ -282,6 +401,7 @@ class _CameraScreenState extends State<CameraScreen> {
   @override
   void dispose() {
     _controller?.dispose();
+    _promptController.dispose();
     super.dispose();
   }
 
@@ -331,6 +451,7 @@ class _CameraScreenState extends State<CameraScreen> {
                     if (_isIdentifying) _buildIdentifyingIndicator(),
                     if (_showingToast) _buildToast(),
                     if (_lastError != null) _buildErrorCard(),
+                    if (_waitingForUserPrompt) _buildPromptInput(),
                   ],
                 ),
               ),
@@ -364,10 +485,12 @@ class _CameraScreenState extends State<CameraScreen> {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         if (_previewRenderSize.width != rendW || _previewRenderSize.height != rendH ||
-            _previewOffset.dx != ox || _previewOffset.dy != oy) {
+            _previewOffset.dx != ox || _previewOffset.dy != oy ||
+            _cameraAreaSize.width != areaW || _cameraAreaSize.height != areaH) {
           setState(() {
             _previewRenderSize = Size(rendW, rendH);
             _previewOffset = Offset(ox, oy);
+            _cameraAreaSize = Size(areaW, areaH);
           });
           debugPrint('ONESPOT PREVIEW: size=$_previewRenderSize offset=$_previewOffset '
               'area=${areaW}x$areaH img=${imgW}x$imgH scale=$scale');
@@ -385,52 +508,7 @@ class _CameraScreenState extends State<CameraScreen> {
       );
     });
   }
-  Widget _buildTopBar() {
-    return Container(
-      color: Colors.black,
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          // Flexible so the title yields width to the buttons instead of
-          // pushing them off the right edge (which clipped ⚙️ and 📋).
-          Flexible(
-            child: RichText(
-              overflow: TextOverflow.ellipsis,
-              text: const TextSpan(
-                style: TextStyle(fontFamily: 'BebasNeue', fontSize: 24, letterSpacing: 2),
-                children: [
-                  TextSpan(text: 'ONE', style: TextStyle(color: Colors.white)),
-                  TextSpan(text: 'SPOT', style: TextStyle(color: Color(0xFF00FF88))),
-                ],
-              ),
-            ),
-          ),
-          Row(mainAxisSize: MainAxisSize.min, children: [
-            _iconBtn(_torchOn ? '🔦' : '🔆', _toggleTorch),
-            const SizedBox(width: 6),
-            _iconBtn('🔄', _flipCamera),
-            const SizedBox(width: 6),
-            _iconBtn('📋', () => Navigator.pushNamed(context, '/history')),
-            const SizedBox(width: 6),
-            _iconBtn('⚙️', () => Navigator.pushNamed(context, '/settings')),
-          ]),
-        ],
-      ),
-    );
-  }
 
-  Widget _iconBtn(String icon, VoidCallback onTap) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        width: 32, height: 32,
-        decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: Colors.white24)),
-        child: Center(child: Text(icon, style: const TextStyle(fontSize: 18))),
-      ),
-    );
-  }
 
   // ── Counter panel ─────────────────────────────────────────────────────────
 
@@ -551,33 +629,97 @@ class _CameraScreenState extends State<CameraScreen> {
     return Stack(
       children: _boundingBoxes.asMap().entries.map((entry) {
         final r = entry.value;
-        final idx = entry.key;
-        // Cycle through distinct hues so overlapping boxes are distinguishable.
-        final color = HSVColor.fromAHSV(1, (idx * 47.0) % 360, 1, 1).toColor();
+        final cx = r.left + r.width / 2;
+        final cy = r.top + r.height / 2;
         return Positioned(
-          left: r.left,
-          top: r.top,
+          left: cx - 14,
+          top: cy - 14,
           child: Container(
-            width: r.width,
-            height: r.height,
+            width: 28, height: 28,
             decoration: BoxDecoration(
-              border: Border.all(color: color, width: 2),
-              color: color.withOpacity(0.08),
+              color: const Color(0xFF00FF88),
+              shape: BoxShape.circle,
+              boxShadow: [BoxShadow(color: Colors.black54, blurRadius: 4, spreadRadius: 1)],
             ),
-            child: r.height > 20
-              ? Align(
-                  alignment: Alignment.topLeft,
-                  child: Container(
-                    color: color.withOpacity(0.7),
-                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                    child: Text('${idx + 1}',
-                        style: const TextStyle(color: Colors.black, fontSize: 10, fontWeight: FontWeight.bold)),
-                  ),
-                )
-              : null,
+            child: Center(
+              child: Text('${entry.key + 1}',
+                style: const TextStyle(color: Colors.black, fontSize: 13, fontWeight: FontWeight.bold)),
+            ),
           ),
         );
       }).toList(),
+    );
+  }
+
+  Widget _buildPromptInput() {
+    return Positioned(
+      left: 0, right: 0, bottom: 0,
+      child: Material(
+        color: Colors.transparent,
+        child: Container(
+          decoration: const BoxDecoration(
+            color: Color(0xE6080810),
+            border: Border(top: BorderSide(color: Color(0xFF00FF88), width: 1)),
+          ),
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 14),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(children: [
+                const Icon(Icons.chat_bubble_outline, color: Color(0xFF00FF88), size: 14),
+                const SizedBox(width: 6),
+                const Expanded(
+                  child: Text('Προσθέστε οδηγία (προαιρετικό)',
+                    style: TextStyle(color: Color(0xFF00FF88), fontSize: 11, letterSpacing: 0.5)),
+                ),
+                GestureDetector(
+                  onTap: _cancelPrompt,
+                  child: const Icon(Icons.close, color: Colors.white38, size: 18),
+                ),
+              ]),
+              const SizedBox(height: 8),
+              Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Expanded(
+                  child: TextField(
+                    controller: _promptController,
+                    autofocus: true,
+                    style: const TextStyle(color: Colors.white, fontSize: 14),
+                    maxLines: 2,
+                    minLines: 1,
+                    textInputAction: TextInputAction.send,
+                    onSubmitted: (_) => _submitWithPrompt(),
+                    decoration: InputDecoration(
+                      hintText: 'π.χ. μέτρα μόνο τα κόκκινα…',
+                      hintStyle: const TextStyle(color: Colors.white24, fontSize: 13),
+                      filled: true,
+                      fillColor: const Color(0xFF1A1A2E),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide.none,
+                      ),
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                GestureDetector(
+                  onTap: _submitWithPrompt,
+                  child: Container(
+                    width: 46, height: 46,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF00FF88),
+                      shape: BoxShape.circle,
+                      boxShadow: [BoxShadow(color: const Color(0xFF00FF88).withAlpha(60), blurRadius: 8)],
+                    ),
+                    child: const Icon(Icons.send_rounded, color: Colors.black, size: 20),
+                  ),
+                ),
+              ]),
+            ],
+          ),
+        ),
+      ),
     );
   }
 

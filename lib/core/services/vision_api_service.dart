@@ -5,6 +5,12 @@ import 'package:http/http.dart' as http;
 
 enum ApiProvider { claude, chatgpt, gemini }
 
+class SimilarResult {
+  final String name;
+  final List<Map<String, dynamic>> items;
+  SimilarResult({required this.name, required this.items});
+}
+
 class VisionApiService {
   final ApiProvider provider;
   final String apiKey;
@@ -33,8 +39,9 @@ class VisionApiService {
   /// in the full frame that match the template type.
   /// Each box: {x, y, w, h} as fractions (0.0–1.0) of full-image dimensions,
   /// where (x, y) is the top-left corner.
-  Future<List<Map<String, dynamic>>> findSimilar(
-      Uint8List templateBytes, Uint8List fullBytes) async {
+  Future<SimilarResult> findSimilar(
+      Uint8List templateBytes, Uint8List fullBytes,
+      {String language = 'Greek', String? userHint}) async {
     final b64Template = base64Encode(templateBytes);
     final b64Full = base64Encode(fullBytes);
     // Detect actual format from magic bytes so the declared media_type is always
@@ -43,13 +50,44 @@ class VisionApiService {
     // Claude 400 error, so we detect here instead.
     final mimeTemplate = _detectMime(templateBytes);
     final mimeFull = _detectMime(fullBytes);
-    const prompt =
-        'Look at Image 1 (template object) and Image 2 (full scene). '
-        'Find ALL objects in Image 2 that are the same type as Image 1. '
-        'Output ONLY a raw JSON array with no explanation, no markdown, no text before or after. '
-        'Format: [{"x":0.1,"y":0.2,"w":0.1,"h":0.1}] '
-        'where values are 0.0-1.0 fractions of Image 2 dimensions. '
-        'If none found output exactly: []';
+    final hintSection = userHint != null && userHint.trim().isNotEmpty
+        ? 'USER INPUT: "${userHint.trim()}"\n'
+          'The user may have written a question (e.g. "how many leaves?") or an instruction '
+          '(e.g. "count only the red ones"). Either way, treat it as a directive that '
+          'OVERRIDES OR REFINES the default counting rules below. '
+          'If it is a question, answer it by counting accordingly.\n\n'
+        : '';
+    final prompt = hintSection +
+        'You are a precise object detector. '
+        'Image 1 is a TEMPLATE. The object you must search for is the one at the CENTRE of Image 1. '
+        'Ignore anything near the edges of Image 1 — focus only on the central object. '
+        'Study that central object carefully: note its type, shape, colour, and texture. '
+        'Image 2 is the full camera scene. '
+        'TASK: Find every real, physical instance in Image 2 that belongs to the SAME SPECIFIC TYPE '
+        'as the central object in Image 1. '
+        'SIMILARITY RULES: '
+        '  • Must be the same specific type — do NOT generalise to a broader category. '
+        '    Example: a small step-light ≠ a large globe lamp; a flip-flop ≠ a shoe. '
+        '  • For natural/organic objects (leaves, seeds, petals, stones, etc.) size and angle '
+        '    NATURALLY vary — count ALL instances of the same species/kind regardless of '
+        '    orientation, partial overlap, or size difference caused by distance. '
+        '  • For man-made objects (bottles, chairs, shoes, etc.) keep the stricter shape+size match. '
+        'COUNTING RULES: '
+        '1. Scan systematically: top-left → top-right, row by row, until bottom-right. '
+        '2. Count ALL matching instances — even partially occluded, overlapping, or at image edges. '
+        '3. For dense clusters (leaves on a plant, seeds in a pile): count each individual unit. '
+        '   Do NOT stop early — scan the ENTIRE image. '
+        '4. DO NOT count objects visible on a turned-on TV/monitor/phone screen. '
+        '5. Count each object EXACTLY ONCE — no duplicates. '
+        'After your initial scan, do ONE re-scan to confirm you have not missed any instances. '
+        'BOUNDING BOX: Draw the tightest possible rectangle around each matched object. '
+        'x1,y1 = TOP-LEFT corner, x2,y2 = BOTTOM-RIGHT corner, '
+        'as fractions 0.0-1.0 of Image 2 dimensions. '
+        'NAME: use the specific common name in $language (e.g. "σαγιονάρα", "φύλλο pothos"). '
+        'If you cannot identify the exact type, use "αντικείμενο" — but still count and box every instance. '
+        'Output ONLY raw JSON — no markdown, no extra text. '
+        'Format: {"name":"object name in $language","items":[{"x1":0.1,"y1":0.2,"x2":0.3,"y2":0.4},...]}. '
+        'If there are genuinely ZERO matching objects: {"name":"αντικείμενο","items":[]}';
     switch (provider) {
       case ApiProvider.claude:
         return _callClaudeSimilar(b64Template, mimeTemplate, b64Full, mimeFull, prompt);
@@ -159,7 +197,7 @@ class VisionApiService {
     return rawBody;
   }
 
-  Future<List<Map<String, dynamic>>> _callClaudeSimilar(
+  Future<SimilarResult> _callClaudeSimilar(
       String b64Template, String mimeTemplate,
       String b64Full, String mimeFull,
       String prompt) async {
@@ -185,14 +223,14 @@ class VisionApiService {
     if (content is! List || content.isEmpty || content[0]['text'] == null) {
       throw Exception('Claude returned no text. Raw: ${res.body}');
     }
-    final result = _extractJsonList(content[0]['text'] as String);
     final rawText = content[0]['text'] as String;
     debugPrint('SIMILAR_RAW: ${rawText.substring(0, rawText.length.clamp(0, 200))}');
-    debugPrint('SIMILAR_PARSED: $result');
+    final result = _extractSimilarResult(rawText);
+    debugPrint('SIMILAR_PARSED: name=${result.name} count=${result.items.length}');
     return result;
   }
 
-  Future<List<Map<String, dynamic>>> _callOpenAISimilar(
+  Future<SimilarResult> _callOpenAISimilar(
       String b64Template, String mimeTemplate,
       String b64Full, String mimeFull,
       String prompt) async {
@@ -218,10 +256,10 @@ class VisionApiService {
     if (choices is! List || choices.isEmpty || choices[0]['message']?['content'] == null) {
       throw Exception('OpenAI returned no text. Raw: ${res.body}');
     }
-    return _extractJsonList(choices[0]['message']['content'] as String);
+    return _extractSimilarResult(choices[0]['message']['content'] as String);
   }
 
-  Future<List<Map<String, dynamic>>> _callGeminiSimilar(
+  Future<SimilarResult> _callGeminiSimilar(
       String b64Template, String mimeTemplate,
       String b64Full, String mimeFull,
       String prompt) async {
@@ -246,7 +284,7 @@ class VisionApiService {
     if (parts is! List || parts.isEmpty || parts[0]['text'] == null) {
       throw Exception('Gemini no text. Raw: ${res.body}');
     }
-    return _extractJsonList(parts[0]['text'] as String);
+    return _extractSimilarResult(parts[0]['text'] as String);
   }
 
   // Robustly extracts a JSON object from model text that may include code
@@ -259,6 +297,44 @@ class VisionApiService {
       t = t.substring(start, end + 1);
     }
     return jsonDecode(t) as Map<String, dynamic>;
+  }
+
+  // Parses {"name":"...","items":[{cx,cy},...]} from model output.
+  // Falls back gracefully: if the model still returns a bare array, wraps it
+  // with a generic name so nothing crashes.
+  SimilarResult _extractSimilarResult(String text) {
+    var t = text.replaceAll('```json', '').replaceAll('```', '').trim();
+    // Try object format first
+    final objStart = t.indexOf('{');
+    final objEnd = t.lastIndexOf('}');
+    if (objStart != -1 && objEnd > objStart) {
+      try {
+        final map = jsonDecode(t.substring(objStart, objEnd + 1)) as Map<String, dynamic>;
+        final name = (map['name'] as String?) ?? 'αντικείμενο';
+        final rawItems = map['items'];
+        if (rawItems is List) {
+          return SimilarResult(
+            name: name,
+            items: rawItems.whereType<Map<String, dynamic>>().toList(),
+          );
+        }
+      } catch (_) {}
+    }
+    // Fallback: bare array (old format)
+    final arrStart = t.indexOf('[');
+    final arrEnd = t.lastIndexOf(']');
+    if (arrStart != -1 && arrEnd > arrStart) {
+      try {
+        final list = jsonDecode(t.substring(arrStart, arrEnd + 1));
+        if (list is List) {
+          return SimilarResult(
+            name: 'αντικείμενο',
+            items: list.whereType<Map<String, dynamic>>().toList(),
+          );
+        }
+      } catch (_) {}
+    }
+    return SimilarResult(name: 'αντικείμενο', items: []);
   }
 
   // Robustly extracts a JSON array from model text that may include code

@@ -40,6 +40,7 @@ dependencies:
   shared_preferences: ^2.5.5
   url_launcher: ^6.3.2
   ultralytics_yolo: ^0.6.0
+  path_provider: ^2.1.5
 
 dev_dependencies:
   flutter_test:
