@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:path_provider/path_provider.dart';
 import 'dart:convert';
@@ -57,10 +58,15 @@ class HistoryService {
     if (imageBytes != null) {
       try {
         final dir = await getApplicationDocumentsDirectory();
-        final file = File('${dir.path}/onespot_thumb_$id.jpg');
+        final isPng = imageBytes.length >= 4 &&
+            imageBytes[0] == 0x89 && imageBytes[1] == 0x50;
+        final ext = isPng ? 'png' : 'jpg';
+        final file = File('${dir.path}/onespot_thumb_$id.$ext');
         await file.writeAsBytes(imageBytes);
         thumbPath = file.path;
-      } catch (_) {}
+      } catch (e) {
+        debugPrint('Thumbnail save failed: $e');
+      }
     }
 
     final entry = HistoryEntry(

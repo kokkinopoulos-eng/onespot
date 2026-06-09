@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../../core/services/vision_api_service.dart';
+import '../../core/services/local_similarity_service.dart';
 import '../../core/services/settings_service.dart';
 import '../../core/models/history_entry.dart';
 
@@ -149,10 +150,18 @@ class _CameraScreenState extends State<CameraScreen> {
     if (wasTap) {
       final normRect = _selectionRect != null ? _normalizeRect(_selectionRect!) : null;
       if (normRect != null && normRect.contains(upPos)) {
-        setState(() {
-          _dotPosition = upPos;
-          _pendingTapPosition = upPos;
-          _waitingForUserPrompt = true;
+        _settings.getProvider().then((provider) {
+          if (!mounted) return;
+          if (provider == 'local') {
+            setState(() => _dotPosition = upPos);
+            _onTap(upPos);
+          } else {
+            setState(() {
+              _dotPosition = upPos;
+              _pendingTapPosition = upPos;
+              _waitingForUserPrompt = true;
+            });
+          }
         });
       } else if (normRect == null) {
         _showToast('Draw a selection rect, then tap inside it');
@@ -194,22 +203,25 @@ class _CameraScreenState extends State<CameraScreen> {
       setState(() { _tapPosition = position; _lastError = null; });
 
       final provider = await _settings.getProvider();
-      final key = await _settings.getApiKey(provider);
-      if (key == null || key.isEmpty) {
-        setState(() => _lastError = 'No API key for "$provider". Add one in Settings.');
-        _showToast('Add API key in Settings');
-        return;
-      }
-      // Guard against a stale/unknown provider (e.g. a previously-saved 'yolo')
-      // that would otherwise throw a StateError from firstWhere.
+
+      // ── Validate API key (cloud only) ─────────────────────────────────────────
       ApiProvider? apiProvider;
-      for (final e in ApiProvider.values) {
-        if (e.name == provider) { apiProvider = e; break; }
-      }
-      if (apiProvider == null) {
-        setState(() => _lastError = 'Unknown provider "$provider". Pick one in Settings.');
-        _showToast('Pick a provider in Settings');
-        return;
+      String? key;
+      if (provider != 'local') {
+        key = await _settings.getApiKey(provider);
+        if (key == null || key.isEmpty) {
+          setState(() => _lastError = 'No API key for "$provider". Add one in Settings.');
+          _showToast('Add API key in Settings');
+          return;
+        }
+        for (final e in ApiProvider.values) {
+          if (e.name == provider) { apiProvider = e; break; }
+        }
+        if (apiProvider == null) {
+          setState(() => _lastError = 'Unknown provider "$provider". Pick one in Settings.');
+          _showToast('Pick a provider in Settings');
+          return;
+        }
       }
 
       setState(() { _isIdentifying = true; _isPaused = true; });
@@ -281,6 +293,65 @@ class _CameraScreenState extends State<CameraScreen> {
         return;
       }
 
+      // ── Local (offline NCC) path ─────────────────────────────────────────────
+      if (provider == 'local') {
+        final normRect = _normalizeRect(_selectionRect!);
+        final halfW = normRect.width / 2;
+        final halfH = normRect.height / 2;
+        final tapX = position.dx.clamp(0.0, areaW);
+        final tapY = position.dy.clamp(0.0, areaH);
+        Uint8List localTemplate = viewportBytes;
+        try {
+          final src = ui.Rect.fromLTRB(
+            (tapX - halfW).clamp(0.0, areaW),
+            (tapY - halfH).clamp(0.0, areaH),
+            (tapX + halfW).clamp(0.0, areaW),
+            (tapY + halfH).clamp(0.0, areaH),
+          );
+          final rec = ui.PictureRecorder();
+          ui.Canvas(rec).drawImageRect(viewportImg, src,
+              ui.Rect.fromLTWH(0, 0, src.width, src.height), ui.Paint());
+          final tImg = await rec.endRecording().toImage(src.width.toInt(), src.height.toInt());
+          final bd = await tImg.toByteData(format: ui.ImageByteFormat.png);
+          if (bd != null) localTemplate = bd.buffer.asUint8List();
+        } catch (_) {}
+
+        final similar = await LocalSimilarityService().findSimilar(localTemplate, viewportBytes);
+        double n(dynamic v) {
+          if (v is num) return v.toDouble();
+          if (v is String) return double.tryParse(v) ?? 0.0;
+          return 0.0;
+        }
+        final rects = similar.items.map<Rect>((b) => Rect.fromLTRB(
+          n(b['x1']) * areaW, n(b['y1']) * areaH,
+          n(b['x2']) * areaW, n(b['y2']) * areaH,
+        )).toList();
+
+        setState(() {
+          _isIdentifying = false;
+          _boundingBoxes = rects;
+          _counts.clear();
+          if (rects.isNotEmpty) _counts[rects.length == 1 ? 'αντικείμενο' : 'αντικείμενα'] = rects.length;
+          _toastMsg = rects.isEmpty ? 'Δεν βρέθηκαν αντικείμενα' : '${rects.length} ${rects.length == 1 ? 'αντικείμενο' : 'αντικείμενα'} (local)';
+          _showingToast = true;
+        });
+        if (rects.isNotEmpty) {
+          try {
+            await HistoryService().add('countOne',
+                {'name': rects.length == 1 ? 'αντικείμενο' : 'αντικείμενα', 'count': rects.length},
+                imageBytes: viewportBytes);
+          } catch (e) {
+            debugPrint('History save failed: $e');
+          }
+        }
+        Future.delayed(const Duration(seconds: 5), () {
+          if (mounted) setState(() => _showingToast = false);
+        });
+        await Future.delayed(const Duration(seconds: 8));
+        if (mounted) setState(() { _tapPosition = null; _isPaused = false; });
+        return;
+      }
+
       // ── Template crop ────────────────────────────────────────────────────────
       // Crop a region the same size as the selection rect but RE-CENTERED on
       // the tap point. This gives the model full context (not a tiny patch)
@@ -308,7 +379,7 @@ class _CameraScreenState extends State<CameraScreen> {
       } catch (_) {}
 
       final language = await _settings.getLanguage();
-      final apiService = VisionApiService(provider: apiProvider, apiKey: key);
+      final apiService = VisionApiService(provider: apiProvider!, apiKey: key!);
       final similar = await apiService.findSimilar(templateBytes, viewportBytes,
           language: language, userHint: userHint);
 
@@ -355,7 +426,15 @@ class _CameraScreenState extends State<CameraScreen> {
         _showingToast = true;
       });
       if (rects.isNotEmpty) {
-        HistoryService().add('countOne', {'name': displayName(rects.length), 'count': rects.length}, imageBytes: fullBytes);
+        try {
+          await HistoryService().add(
+            'countOne',
+            {'name': displayName(rects.length), 'count': rects.length},
+            imageBytes: viewportBytes,
+          );
+        } catch (e) {
+          debugPrint('History save failed: $e');
+        }
       }
       Future.delayed(const Duration(seconds: 5), () {
         if (mounted) setState(() => _showingToast = false);

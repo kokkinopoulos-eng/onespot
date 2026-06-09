@@ -14,7 +14,8 @@ class SettingsService {
 
   Future<String> getProvider() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_keyProvider) ?? 'claude';
+    final saved = prefs.getString(_keyProvider) ?? 'claude';
+    return saved == 'yolo' ? 'local' : saved;
   }
 
   Future<void> saveApiKey(String provider, String key) async {

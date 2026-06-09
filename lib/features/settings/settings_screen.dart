@@ -29,7 +29,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _load() async {
-    _provider = await _settings.getProvider();
+    final saved = await _settings.getProvider();
+    _provider = (saved == 'yolo') ? 'local' : saved;
     _languageController.text = await _settings.getLanguage();
     final keys = await _settings.getAllKeys();
     keys.forEach((k, v) { if (v != null) _controllers[k]?.text = v; });
@@ -42,11 +43,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
     for (final e in _controllers.entries) {
       if (e.value.text.isNotEmpty) await _settings.saveApiKey(e.key, e.value.text);
     }
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Settings saved ✓'), backgroundColor: Color(0xFF00FF88)),
-      );
-    }
+    if (!mounted) return;
+    final hasKey = _provider == 'local' ||
+        (_controllers[_provider]?.text.isNotEmpty ?? false) ||
+        (await _settings.getApiKey(_provider))?.isNotEmpty == true;
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      hasKey
+        ? const SnackBar(content: Text('Settings saved ✓'), backgroundColor: Color(0xFF00FF88))
+        : SnackBar(
+            content: Text('Saved — αλλά δεν υπάρχει API key για $_provider'),
+            backgroundColor: const Color(0xFFFF6B00),
+            duration: const Duration(seconds: 4),
+          ),
+    );
   }
 
   @override
@@ -140,13 +150,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
   );
 
   Widget _providerSelector() {
-    const icons = {'yolo': '🎯', 'claude': '🤖', 'chatgpt': '💬', 'gemini': '✨'};
-    const names = {'yolo': 'YOLO', 'claude': 'claude', 'chatgpt': 'chatgpt', 'gemini': 'gemini'};
+    const icons = {'local': '📱', 'claude': '🤖', 'chatgpt': '💬', 'gemini': '✨'};
+    const names = {'local': 'Local', 'claude': 'Claude', 'chatgpt': 'ChatGPT', 'gemini': 'Gemini'};
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Row(
-          children: ['yolo', 'claude', 'chatgpt', 'gemini'].map((p) {
+          children: ['local', 'claude', 'chatgpt', 'gemini'].map((p) {
             final active = _provider == p;
             return Expanded(
               child: GestureDetector(
@@ -169,12 +179,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
             );
           }).toList(),
         ),
-        if (_provider == 'yolo')
-          const Padding(
-            padding: EdgeInsets.only(top: 10),
-            child: Text('Local YOLO runs fully offline — no API key needed.',
-              style: TextStyle(color: Colors.white38, fontSize: 11)),
+        Padding(
+          padding: const EdgeInsets.only(top: 10),
+          child: Text(
+            _provider == 'local'
+              ? 'Offline — χρησιμοποιεί template matching. Δεν χρειάζεται API key ή internet.'
+              : 'Make sure you have entered the API key for ${names[_provider] ?? _provider} below.',
+            style: const TextStyle(color: Colors.white38, fontSize: 11),
           ),
+        ),
       ],
     );
   }
