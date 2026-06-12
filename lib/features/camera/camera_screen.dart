@@ -71,15 +71,20 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Future<void> _startCamera(CameraDescription cam) async {
-    _controller = CameraController(cam, ResolutionPreset.high, enableAudio: false);
+    _controller = CameraController(
+      cam,
+      ResolutionPreset.high,
+      enableAudio: false,
+    );
     await _controller!.initialize();
     final maxZoom = await _controller!.getMaxZoomLevel();
     final minZoom = await _controller!.getMinZoomLevel();
-    if (mounted) setState(() {
-      _isInitialized = true;
-      _maxZoom = maxZoom;
-      _minZoom = minZoom;
-    });
+    if (mounted)
+      setState(() {
+        _isInitialized = true;
+        _maxZoom = maxZoom;
+        _minZoom = minZoom;
+      });
   }
 
   Future<void> _flipCamera() async {
@@ -126,7 +131,10 @@ class _CameraScreenState extends State<CameraScreen> {
       final pts = _pointers.values.toList();
       final dist = (pts[0] - pts[1]).distance;
       if (_pinchBaseDist > 0) {
-        final newZoom = (_pinchBaseZoom * (dist / _pinchBaseDist)).clamp(_minZoom, _maxZoom);
+        final newZoom = (_pinchBaseZoom * (dist / _pinchBaseDist)).clamp(
+          _minZoom,
+          _maxZoom,
+        );
         _controller?.setZoomLevel(newZoom);
         setState(() => _zoomLevel = newZoom);
       }
@@ -148,7 +156,9 @@ class _CameraScreenState extends State<CameraScreen> {
     _pointers.remove(e.pointer);
     final wasTap = wasOnlyPointer && !_moved && !_isPinch;
     if (wasTap) {
-      final normRect = _selectionRect != null ? _normalizeRect(_selectionRect!) : null;
+      final normRect = _selectionRect != null
+          ? _normalizeRect(_selectionRect!)
+          : null;
       if (normRect != null && normRect.contains(upPos)) {
         _settings.getProvider().then((provider) {
           if (!mounted) return;
@@ -166,7 +176,11 @@ class _CameraScreenState extends State<CameraScreen> {
       } else if (normRect == null) {
         _showToast('Draw a selection rect, then tap inside it');
       } else {
-        setState(() { _selectionRect = null; _dotPosition = null; _boundingBoxes = []; });
+        setState(() {
+          _selectionRect = null;
+          _dotPosition = null;
+          _boundingBoxes = [];
+        });
       }
     }
     _resetAfterPointerLift();
@@ -192,6 +206,114 @@ class _CameraScreenState extends State<CameraScreen> {
     r.top > r.bottom ? r.top : r.bottom,
   );
 
+  Rect _clampRectToArea(Rect r, double areaW, double areaH) {
+    final normalized = _normalizeRect(r);
+    return Rect.fromLTRB(
+      normalized.left.clamp(0.0, areaW),
+      normalized.top.clamp(0.0, areaH),
+      normalized.right.clamp(0.0, areaW),
+      normalized.bottom.clamp(0.0, areaH),
+    );
+  }
+
+  Future<Uint8List> _cropViewportImage(ui.Image image, Rect src) async {
+    final crop = _normalizeRect(src);
+    final w = math.max(1, crop.width.round());
+    final h = math.max(1, crop.height.round());
+    final rec = ui.PictureRecorder();
+    Canvas(rec).drawImageRect(
+      image,
+      crop,
+      Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble()),
+      Paint(),
+    );
+    final cropped = await rec.endRecording().toImage(w, h);
+    final bd = await cropped.toByteData(format: ui.ImageByteFormat.png);
+    return bd?.buffer.asUint8List() ?? Uint8List(0);
+  }
+
+  Rect _similarItemToRect(
+    Map<String, dynamic> item,
+    double imageW,
+    double imageH, {
+    Offset offset = Offset.zero,
+  }) {
+    double n(dynamic v) {
+      if (v is num) return v.toDouble();
+      if (v is String) return double.tryParse(v) ?? 0.0;
+      return 0.0;
+    }
+
+    double scaleX(double v) => v <= 1.0 ? v * imageW : v;
+    double scaleY(double v) => v <= 1.0 ? v * imageH : v;
+
+    if (item.containsKey('x1') &&
+        item.containsKey('y1') &&
+        item.containsKey('x2') &&
+        item.containsKey('y2')) {
+      final left = scaleX(n(item['x1']));
+      final top = scaleY(n(item['y1']));
+      final right = scaleX(n(item['x2']));
+      final bottom = scaleY(n(item['y2']));
+      return _normalizeRect(
+        Rect.fromLTRB(
+          left + offset.dx,
+          top + offset.dy,
+          right + offset.dx,
+          bottom + offset.dy,
+        ),
+      );
+    }
+
+    final x = n(item['x']);
+    final y = n(item['y']);
+    final w = n(item['w']);
+    final h = n(item['h']);
+    final cx = item.containsKey('cx')
+        ? scaleX(n(item['cx']))
+        : scaleX(x) + scaleX(w) / 2;
+    final cy = item.containsKey('cy')
+        ? scaleY(n(item['cy']))
+        : scaleY(y) + scaleY(h) / 2;
+    final boxW = item.containsKey('w') ? math.max(8.0, scaleX(w)) : 48.0;
+    final boxH = item.containsKey('h') ? math.max(8.0, scaleY(h)) : 48.0;
+    return Rect.fromCenter(
+      center: Offset(cx + offset.dx, cy + offset.dy),
+      width: boxW,
+      height: boxH,
+    );
+  }
+
+  List<Rect> _parseSimilarRects(
+    List<Map<String, dynamic>> items,
+    double imageW,
+    double imageH, {
+    Offset offset = Offset.zero,
+    Rect? bounds,
+  }) {
+    final parsed = items
+        .map((item) => _similarItemToRect(item, imageW, imageH, offset: offset))
+        .where((r) => r.width >= 4 && r.height >= 4)
+        .map((r) {
+          if (bounds == null) return r;
+          if (!bounds.contains(r.center)) return Rect.zero;
+          final clipped = r.intersect(bounds);
+          final rectArea = r.width * r.height;
+          final clippedArea = clipped.width * clipped.height;
+          final mostlyInside = rectArea > 0 && clippedArea / rectArea >= 0.60;
+          return mostlyInside && clipped.width >= 4 && clipped.height >= 4
+              ? clipped
+              : Rect.zero;
+        })
+        .where((r) => r != Rect.zero)
+        .toList();
+    parsed.sort((a, b) {
+      final row = a.center.dy.compareTo(b.center.dy);
+      return row != 0 ? row : a.center.dx.compareTo(b.center.dx);
+    });
+    return parsed;
+  }
+
   // ── Count similar objects ──────────────────────────────────────────────────
 
   Future<void> _onTap(Offset position, {String? userHint}) async {
@@ -200,7 +322,10 @@ class _CameraScreenState extends State<CameraScreen> {
     // every failure surfaces in the error card and the busy flag is always
     // reset in the finally block.
     try {
-      setState(() { _tapPosition = position; _lastError = null; });
+      setState(() {
+        _tapPosition = position;
+        _lastError = null;
+      });
 
       final provider = await _settings.getProvider();
 
@@ -210,21 +335,33 @@ class _CameraScreenState extends State<CameraScreen> {
       if (provider != 'local') {
         key = await _settings.getApiKey(provider);
         if (key == null || key.isEmpty) {
-          setState(() => _lastError = 'No API key for "$provider". Add one in Settings.');
+          setState(
+            () =>
+                _lastError = 'No API key for "$provider". Add one in Settings.',
+          );
           _showToast('Add API key in Settings');
           return;
         }
         for (final e in ApiProvider.values) {
-          if (e.name == provider) { apiProvider = e; break; }
+          if (e.name == provider) {
+            apiProvider = e;
+            break;
+          }
         }
         if (apiProvider == null) {
-          setState(() => _lastError = 'Unknown provider "$provider". Pick one in Settings.');
+          setState(
+            () => _lastError =
+                'Unknown provider "$provider". Pick one in Settings.',
+          );
           _showToast('Pick a provider in Settings');
           return;
         }
       }
 
-      setState(() { _isIdentifying = true; _isPaused = true; });
+      setState(() {
+        _isIdentifying = true;
+        _isPaused = true;
+      });
       final image = await _controller!.takePicture();
       final fullBytes = await image.readAsBytes();
 
@@ -261,7 +398,10 @@ class _CameraScreenState extends State<CameraScreen> {
           c.translate(rawH, 0);
           c.rotate(math.pi / 2);
           c.drawImage(rawImg, Offset.zero, Paint());
-          orientedImg = await rec.endRecording().toImage(rawH.toInt(), rawW.toInt());
+          orientedImg = await rec.endRecording().toImage(
+            rawH.toInt(),
+            rawW.toInt(),
+          );
           oriW = rawH;
           oriH = rawW;
         } catch (_) {}
@@ -285,7 +425,10 @@ class _CameraScreenState extends State<CameraScreen> {
       try {
         final rec = ui.PictureRecorder();
         Canvas(rec).drawImageRect(orientedImg, vpSrcRect, vpDstRect, Paint());
-        viewportImg = await rec.endRecording().toImage(areaW.toInt(), areaH.toInt());
+        viewportImg = await rec.endRecording().toImage(
+          areaW.toInt(),
+          areaH.toInt(),
+        );
         final bd = await viewportImg.toByteData(format: ui.ImageByteFormat.png);
         viewportBytes = bd?.buffer.asUint8List() ?? fullBytes;
       } catch (_) {
@@ -293,53 +436,71 @@ class _CameraScreenState extends State<CameraScreen> {
         return;
       }
 
+      final searchRect = _clampRectToArea(_selectionRect!, areaW, areaH);
+      final searchOffset = Offset(searchRect.left, searchRect.top);
+      final searchBytes = await _cropViewportImage(viewportImg, searchRect);
+      final searchW = searchRect.width;
+      final searchH = searchRect.height;
+      if (searchBytes.isEmpty || searchW < 8 || searchH < 8) {
+        setState(
+          () => _lastError = 'Selection is too small — draw a larger rectangle',
+        );
+        return;
+      }
+
       // ── Local (offline NCC) path ─────────────────────────────────────────────
       if (provider == 'local') {
-        final normRect = _normalizeRect(_selectionRect!);
-        final halfW = normRect.width / 2;
-        final halfH = normRect.height / 2;
         final tapX = position.dx.clamp(0.0, areaW);
         final tapY = position.dy.clamp(0.0, areaH);
-        Uint8List localTemplate = viewportBytes;
+        final templateHalfW = math.max(
+          18.0,
+          math.min(searchRect.width * 0.18, 54.0),
+        );
+        final templateHalfH = math.max(
+          18.0,
+          math.min(searchRect.height * 0.18, 54.0),
+        );
+        Uint8List localTemplate = searchBytes;
         try {
           final src = ui.Rect.fromLTRB(
-            (tapX - halfW).clamp(0.0, areaW),
-            (tapY - halfH).clamp(0.0, areaH),
-            (tapX + halfW).clamp(0.0, areaW),
-            (tapY + halfH).clamp(0.0, areaH),
+            (tapX - templateHalfW).clamp(searchRect.left, searchRect.right),
+            (tapY - templateHalfH).clamp(searchRect.top, searchRect.bottom),
+            (tapX + templateHalfW).clamp(searchRect.left, searchRect.right),
+            (tapY + templateHalfH).clamp(searchRect.top, searchRect.bottom),
           );
-          final rec = ui.PictureRecorder();
-          ui.Canvas(rec).drawImageRect(viewportImg, src,
-              ui.Rect.fromLTWH(0, 0, src.width, src.height), ui.Paint());
-          final tImg = await rec.endRecording().toImage(src.width.toInt(), src.height.toInt());
-          final bd = await tImg.toByteData(format: ui.ImageByteFormat.png);
-          if (bd != null) localTemplate = bd.buffer.asUint8List();
+          localTemplate = await _cropViewportImage(viewportImg, src);
         } catch (_) {}
 
-        final similar = await LocalSimilarityService().findSimilar(localTemplate, viewportBytes);
-        double n(dynamic v) {
-          if (v is num) return v.toDouble();
-          if (v is String) return double.tryParse(v) ?? 0.0;
-          return 0.0;
-        }
-        final rects = similar.items.map<Rect>((b) => Rect.fromLTRB(
-          n(b['x1']) * areaW, n(b['y1']) * areaH,
-          n(b['x2']) * areaW, n(b['y2']) * areaH,
-        )).toList();
+        final similar = await LocalSimilarityService().findSimilar(
+          localTemplate,
+          searchBytes,
+        );
+        final rects = _parseSimilarRects(
+          similar.items,
+          searchW,
+          searchH,
+          offset: searchOffset,
+          bounds: searchRect,
+        );
 
         setState(() {
           _isIdentifying = false;
           _boundingBoxes = rects;
           _counts.clear();
-          if (rects.isNotEmpty) _counts[rects.length == 1 ? 'αντικείμενο' : 'αντικείμενα'] = rects.length;
-          _toastMsg = rects.isEmpty ? 'Δεν βρέθηκαν αντικείμενα' : '${rects.length} ${rects.length == 1 ? 'αντικείμενο' : 'αντικείμενα'} (local)';
+          if (rects.isNotEmpty)
+            _counts[rects.length == 1 ? 'αντικείμενο' : 'αντικείμενα'] =
+                rects.length;
+          _toastMsg = rects.isEmpty
+              ? 'Δεν βρέθηκαν αντικείμενα'
+              : '${rects.length} ${rects.length == 1 ? 'αντικείμενο' : 'αντικείμενα'} (local)';
           _showingToast = true;
         });
         if (rects.isNotEmpty) {
           try {
-            await HistoryService().add('countOne',
-                {'name': rects.length == 1 ? 'αντικείμενο' : 'αντικείμενα', 'count': rects.length},
-                imageBytes: viewportBytes);
+            await HistoryService().add('countOne', {
+              'name': rects.length == 1 ? 'αντικείμενο' : 'αντικείμενα',
+              'count': rects.length,
+            }, imageBytes: viewportBytes);
           } catch (e) {
             debugPrint('History save failed: $e');
           }
@@ -348,66 +509,61 @@ class _CameraScreenState extends State<CameraScreen> {
           if (mounted) setState(() => _showingToast = false);
         });
         await Future.delayed(const Duration(seconds: 8));
-        if (mounted) setState(() { _tapPosition = null; _isPaused = false; });
+        if (mounted)
+          setState(() {
+            _tapPosition = null;
+            _isPaused = false;
+          });
         return;
       }
 
       // ── Template crop ────────────────────────────────────────────────────────
-      // Crop a region the same size as the selection rect but RE-CENTERED on
-      // the tap point. This gives the model full context (not a tiny patch)
-      // while ensuring the tapped object sits at the CENTER of Image 1, so
-      // the "focus on center" prompt instruction is accurate.
-      final normRect = _normalizeRect(_selectionRect!);
-      final halfW = normRect.width / 2;
-      final halfH = normRect.height / 2;
+      // Crop a small patch around the tap point. The selected rectangle is used
+      // as Image 2, so the model counts only inside the user's green box.
       final tapX = position.dx.clamp(0.0, areaW);
       final tapY = position.dy.clamp(0.0, areaH);
-      Uint8List templateBytes = viewportBytes;
+      final templateHalfW = math.max(
+        18.0,
+        math.min(searchRect.width * 0.18, 54.0),
+      );
+      final templateHalfH = math.max(
+        18.0,
+        math.min(searchRect.height * 0.18, 54.0),
+      );
+      Uint8List templateBytes = searchBytes;
       try {
         final src = Rect.fromLTRB(
-          (tapX - halfW).clamp(0.0, areaW),
-          (tapY - halfH).clamp(0.0, areaH),
-          (tapX + halfW).clamp(0.0, areaW),
-          (tapY + halfH).clamp(0.0, areaH),
+          (tapX - templateHalfW).clamp(searchRect.left, searchRect.right),
+          (tapY - templateHalfH).clamp(searchRect.top, searchRect.bottom),
+          (tapX + templateHalfW).clamp(searchRect.left, searchRect.right),
+          (tapY + templateHalfH).clamp(searchRect.top, searchRect.bottom),
         );
-        final rec = ui.PictureRecorder();
-        Canvas(rec).drawImageRect(viewportImg, src,
-            Rect.fromLTWH(0, 0, src.width, src.height), Paint());
-        final tImg = await rec.endRecording().toImage(src.width.toInt(), src.height.toInt());
-        final bd = await tImg.toByteData(format: ui.ImageByteFormat.png);
-        if (bd != null) templateBytes = bd.buffer.asUint8List();
+        templateBytes = await _cropViewportImage(viewportImg, src);
       } catch (_) {}
 
       final language = await _settings.getLanguage();
       final apiService = VisionApiService(provider: apiProvider!, apiKey: key!);
-      final similar = await apiService.findSimilar(templateBytes, viewportBytes,
-          language: language, userHint: userHint);
+      final similar = await apiService.findSimilar(
+        templateBytes,
+        searchBytes,
+        language: language,
+        userHint: userHint,
+      );
 
       // ── Map API fractions → screen rects ────────────────────────────────────
-      // Because the API sees viewportImg (same size as screen area), fractions
-      // multiply directly by areaW/areaH — no cover-fit offset needed.
-      // n() safely converts num OR String values from the model JSON.
-      double n(dynamic v) {
-        if (v is num) return v.toDouble();
-        if (v is String) return double.tryParse(v) ?? 0.0;
-        return 0.0;
-      }
-      final rects = similar.items.map<Rect>((b) {
-        if (b.containsKey('x1') && b.containsKey('y1') &&
-            b.containsKey('x2') && b.containsKey('y2')) {
-          return Rect.fromLTRB(
-            n(b['x1']) * areaW, n(b['y1']) * areaH,
-            n(b['x2']) * areaW, n(b['y2']) * areaH,
-          );
-        }
-        final cx = b.containsKey('cx') ? n(b['cx'])
-            : n(b['x']) + n(b['w']) / 2;
-        final cy = b.containsKey('cy') ? n(b['cy'])
-            : n(b['y']) + n(b['h']) / 2;
-        return Rect.fromLTWH(cx * areaW - 24, cy * areaH - 24, 48.0, 48.0);
-      }).toList();
+      // The API sees only searchBytes (the green selection crop), so returned
+      // fractions are relative to that crop and then shifted back on screen.
+      final rects = _parseSimilarRects(
+        similar.items,
+        searchW,
+        searchH,
+        offset: searchOffset,
+        bounds: searchRect,
+      );
 
-      debugPrint('BOXES: ${rects.length} name=${similar.name}  offset=$_previewOffset');
+      debugPrint(
+        'BOXES: ${rects.length} name=${similar.name}  offset=$_previewOffset',
+      );
       final isGeneric = similar.name.isEmpty || similar.name == 'αντικείμενο';
       final objectName = isGeneric ? 'αντικείμενο' : similar.name;
       // Greek plural for the generic fallback: 1 αντικείμενο / N αντικείμενα
@@ -415,6 +571,7 @@ class _CameraScreenState extends State<CameraScreen> {
         if (isGeneric) return count == 1 ? 'αντικείμενο' : 'αντικείμενα';
         return objectName;
       }
+
       setState(() {
         _isIdentifying = false;
         _boundingBoxes = rects;
@@ -427,11 +584,10 @@ class _CameraScreenState extends State<CameraScreen> {
       });
       if (rects.isNotEmpty) {
         try {
-          await HistoryService().add(
-            'countOne',
-            {'name': displayName(rects.length), 'count': rects.length},
-            imageBytes: viewportBytes,
-          );
+          await HistoryService().add('countOne', {
+            'name': displayName(rects.length),
+            'count': rects.length,
+          }, imageBytes: viewportBytes);
         } catch (e) {
           debugPrint('History save failed: $e');
         }
@@ -440,7 +596,11 @@ class _CameraScreenState extends State<CameraScreen> {
         if (mounted) setState(() => _showingToast = false);
       });
       await Future.delayed(const Duration(seconds: 8));
-      if (mounted) setState(() { _tapPosition = null; _isPaused = false; });
+      if (mounted)
+        setState(() {
+          _tapPosition = null;
+          _isPaused = false;
+        });
     } catch (e, st) {
       debugPrint('ONESPOT _onTap crashed: $e\n$st');
       if (mounted) setState(() => _lastError = e.toString());
@@ -472,8 +632,12 @@ class _CameraScreenState extends State<CameraScreen> {
 
   void _showToast(String msg) {
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(msg), backgroundColor: const Color(0xFF0F0F1A),
-        behavior: SnackBarBehavior.floating, duration: const Duration(seconds: 3)),
+      SnackBar(
+        content: Text(msg),
+        backgroundColor: const Color(0xFF0F0F1A),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 3),
+      ),
     );
   }
 
@@ -491,7 +655,9 @@ class _CameraScreenState extends State<CameraScreen> {
     if (!_isInitialized || _controller == null) {
       return const Scaffold(
         backgroundColor: Color(0xFF080810),
-        body: Center(child: CircularProgressIndicator(color: Color(0xFF00FF88))),
+        body: Center(
+          child: CircularProgressIndicator(color: Color(0xFF00FF88)),
+        ),
       );
     }
     return Scaffold(
@@ -521,8 +687,8 @@ class _CameraScreenState extends State<CameraScreen> {
                   fit: StackFit.expand,
                   children: [
                     _buildCameraPreview(),
-                    if (_boundingBoxes.isNotEmpty) _buildBoundingBoxes(),
                     if (_selectionRect != null) _buildSelectionRect(),
+                    if (_boundingBoxes.isNotEmpty) _buildBoundingBoxes(),
                     if (_dotPosition != null) _buildDot(),
                     _buildZoomSlider(),
                     if (_tapPosition != null) _buildRipple(),
@@ -551,46 +717,51 @@ class _CameraScreenState extends State<CameraScreen> {
     // cover-fit geometry for coordinate mapping.  With BoxFit.cover the
     // rendered image overflows the box (offset can be negative) and the
     // visible portion is a centre-crop of the full sensor frame.
-    return LayoutBuilder(builder: (context, constraints) {
-      final areaW = constraints.maxWidth;
-      final areaH = constraints.maxHeight;
-      final imgW = _controller!.value.previewSize!.height.toDouble();
-      final imgH = _controller!.value.previewSize!.width.toDouble();
-      final scale = math.max(areaW / imgW, areaH / imgH);
-      final rendW = imgW * scale;
-      final rendH = imgH * scale;
-      final ox = (areaW - rendW) / 2; // negative when image wider than area
-      final oy = (areaH - rendH) / 2;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        if (_previewRenderSize.width != rendW || _previewRenderSize.height != rendH ||
-            _previewOffset.dx != ox || _previewOffset.dy != oy ||
-            _cameraAreaSize.width != areaW || _cameraAreaSize.height != areaH) {
-          setState(() {
-            _previewRenderSize = Size(rendW, rendH);
-            _previewOffset = Offset(ox, oy);
-            _cameraAreaSize = Size(areaW, areaH);
-          });
-          debugPrint('ONESPOT PREVIEW: size=$_previewRenderSize offset=$_previewOffset '
-              'area=${areaW}x$areaH img=${imgW}x$imgH scale=$scale');
-        }
-      });
-      return SizedBox.expand(
-        child: FittedBox(
-          fit: BoxFit.cover,
-          child: SizedBox(
-            width: imgW,
-            height: imgH,
-            child: CameraPreview(_controller!),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final areaW = constraints.maxWidth;
+        final areaH = constraints.maxHeight;
+        final imgW = _controller!.value.previewSize!.height.toDouble();
+        final imgH = _controller!.value.previewSize!.width.toDouble();
+        final scale = math.max(areaW / imgW, areaH / imgH);
+        final rendW = imgW * scale;
+        final rendH = imgH * scale;
+        final ox = (areaW - rendW) / 2; // negative when image wider than area
+        final oy = (areaH - rendH) / 2;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          if (_previewRenderSize.width != rendW ||
+              _previewRenderSize.height != rendH ||
+              _previewOffset.dx != ox ||
+              _previewOffset.dy != oy ||
+              _cameraAreaSize.width != areaW ||
+              _cameraAreaSize.height != areaH) {
+            setState(() {
+              _previewRenderSize = Size(rendW, rendH);
+              _previewOffset = Offset(ox, oy);
+              _cameraAreaSize = Size(areaW, areaH);
+            });
+            debugPrint(
+              'ONESPOT PREVIEW: size=$_previewRenderSize offset=$_previewOffset '
+              'area=${areaW}x$areaH img=${imgW}x$imgH scale=$scale',
+            );
+          }
+        });
+        return SizedBox.expand(
+          child: FittedBox(
+            fit: BoxFit.cover,
+            child: SizedBox(
+              width: imgW,
+              height: imgH,
+              child: CameraPreview(_controller!),
+            ),
           ),
-        ),
-      );
-    });
+        );
+      },
+    );
   }
 
-
   // ── Counter panel ─────────────────────────────────────────────────────────
-
 
   // ── Bottom bar ────────────────────────────────────────────────────────────
 
@@ -598,49 +769,92 @@ class _CameraScreenState extends State<CameraScreen> {
     return Container(
       color: Colors.black,
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
-      child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
-        _barBtn('CLEAR', Icons.clear, () => setState(() {
-          _counts.clear();
-          _boundingBoxes.clear();
-          _selectionRect = null;
-          _dotPosition = null;
-          _tapPosition = null;
-        })),
-        _barBtn('HISTORY', Icons.history, () => Navigator.pushNamed(context, '/history')),
-        GestureDetector(
-          onTap: () async {
-            if (_isPaused) {
-              await _controller?.resumePreview();
-            } else {
-              await _controller?.pausePreview();
-            }
-            setState(() => _isPaused = !_isPaused);
-          },
-          child: Container(
-            width: 52, height: 52,
-            decoration: BoxDecoration(shape: BoxShape.circle,
-              color: _isPaused ? const Color(0xFF00FF88) : Colors.transparent,
-              border: Border.all(color: const Color(0xFF00FF88), width: 2)),
-            child: Center(child: Text(_isPaused ? '▶' : '⏸',
-              style: TextStyle(color: _isPaused ? Colors.black : const Color(0xFF00FF88), fontSize: 20))),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+        children: [
+          _barBtn(
+            'CLEAR',
+            Icons.clear,
+            () => setState(() {
+              _counts.clear();
+              _boundingBoxes.clear();
+              _selectionRect = null;
+              _dotPosition = null;
+              _tapPosition = null;
+            }),
           ),
-        ),
-        _barBtn('SETTINGS', Icons.settings, () => Navigator.pushNamed(context, '/settings')),
-        _barBtn('TORCH', _torchOn ? Icons.flashlight_on : Icons.flashlight_off, _toggleTorch),
-        _barBtn('FLIP', Icons.flip_camera_android, _flipCamera),
-        _barBtn('ABOUT', Icons.info_outline, () => Navigator.pushNamed(context, '/about')),
-      ]),
+          _barBtn(
+            'HISTORY',
+            Icons.history,
+            () => Navigator.pushNamed(context, '/history'),
+          ),
+          GestureDetector(
+            onTap: () async {
+              if (_isPaused) {
+                await _controller?.resumePreview();
+              } else {
+                await _controller?.pausePreview();
+              }
+              setState(() => _isPaused = !_isPaused);
+            },
+            child: Container(
+              width: 52,
+              height: 52,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: _isPaused ? const Color(0xFF00FF88) : Colors.transparent,
+                border: Border.all(color: const Color(0xFF00FF88), width: 2),
+              ),
+              child: Center(
+                child: Text(
+                  _isPaused ? '▶' : '⏸',
+                  style: TextStyle(
+                    color: _isPaused ? Colors.black : const Color(0xFF00FF88),
+                    fontSize: 20,
+                  ),
+                ),
+              ),
+            ),
+          ),
+          _barBtn(
+            'SETTINGS',
+            Icons.settings,
+            () => Navigator.pushNamed(context, '/settings'),
+          ),
+          _barBtn(
+            'TORCH',
+            _torchOn ? Icons.flashlight_on : Icons.flashlight_off,
+            _toggleTorch,
+          ),
+          _barBtn('FLIP', Icons.flip_camera_android, _flipCamera),
+          _barBtn(
+            'ABOUT',
+            Icons.info_outline,
+            () => Navigator.pushNamed(context, '/about'),
+          ),
+        ],
+      ),
     );
   }
 
   Widget _barBtn(String label, IconData icon, VoidCallback onTap) {
     return GestureDetector(
       onTap: onTap,
-      child: Column(mainAxisSize: MainAxisSize.min, children: [
-        Icon(icon, color: Colors.white54, size: 22),
-        const SizedBox(height: 3),
-        Text(label, style: const TextStyle(color: Colors.white38, fontSize: 9, letterSpacing: 0.5)),
-      ]),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, color: Colors.white54, size: 22),
+          const SizedBox(height: 3),
+          Text(
+            label,
+            style: const TextStyle(
+              color: Colors.white38,
+              fontSize: 9,
+              letterSpacing: 0.5,
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -657,11 +871,21 @@ class _CameraScreenState extends State<CameraScreen> {
           color: const Color(0xFF00FF88).withOpacity(0.08),
         ),
         child: normalized.width > 80 && normalized.height > 40
-          ? const Align(alignment: Alignment.topCenter,
-              child: Padding(padding: EdgeInsets.only(top: 4),
-                child: Text('Tap inside to count',
-                  style: TextStyle(color: Color(0xFF00FF88), fontSize: 10, letterSpacing: 1))))
-          : null,
+            ? const Align(
+                alignment: Alignment.topCenter,
+                child: Padding(
+                  padding: EdgeInsets.only(top: 4),
+                  child: Text(
+                    'Tap inside to count',
+                    style: TextStyle(
+                      color: Color(0xFF00FF88),
+                      fontSize: 10,
+                      letterSpacing: 1,
+                    ),
+                  ),
+                ),
+              )
+            : null,
       ),
     );
   }
@@ -671,7 +895,11 @@ class _CameraScreenState extends State<CameraScreen> {
       left: 12,
       bottom: 12,
       child: Container(
-        constraints: const BoxConstraints(minWidth: 120, maxWidth: 180, maxHeight: 180),
+        constraints: const BoxConstraints(
+          minWidth: 120,
+          maxWidth: 180,
+          maxHeight: 180,
+        ),
         padding: const EdgeInsets.all(10),
         decoration: BoxDecoration(
           color: Colors.black.withOpacity(0.75),
@@ -682,22 +910,62 @@ class _CameraScreenState extends State<CameraScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Text('DETECTED', style: TextStyle(color: Color(0xFF00FF88), fontSize: 9, letterSpacing: 2)),
+            const Text(
+              'DETECTED',
+              style: TextStyle(
+                color: Color(0xFF00FF88),
+                fontSize: 9,
+                letterSpacing: 2,
+              ),
+            ),
             const SizedBox(height: 6),
-            ..._counts.entries.map((e) => Padding(
-              padding: const EdgeInsets.symmetric(vertical: 1),
-              child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-                Expanded(child: Text(e.key, style: const TextStyle(color: Colors.white, fontSize: 11), overflow: TextOverflow.ellipsis)),
-                const SizedBox(width: 8),
-                Text(e.value.toString(), style: const TextStyle(color: Color(0xFF00FF88), fontSize: 13, fontWeight: FontWeight.bold)),
-              ]),
-            )),
+            ..._counts.entries.map(
+              (e) => Padding(
+                padding: const EdgeInsets.symmetric(vertical: 1),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Expanded(
+                      child: Text(
+                        e.key,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 11,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      e.value.toString(),
+                      style: const TextStyle(
+                        color: Color(0xFF00FF88),
+                        fontSize: 13,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
             const Divider(color: Color(0xFF00FF88), height: 10, thickness: 0.3),
-            Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-              const Text('TOTAL', style: TextStyle(color: Colors.white38, fontSize: 9)),
-              Text(_counts.values.fold(0, (a, b) => a + b).toString(),
-                style: const TextStyle(color: Color(0xFF00FF88), fontWeight: FontWeight.bold, fontSize: 12)),
-            ]),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  'TOTAL',
+                  style: TextStyle(color: Colors.white38, fontSize: 9),
+                ),
+                Text(
+                  _counts.values.fold(0, (a, b) => a + b).toString(),
+                  style: const TextStyle(
+                    color: Color(0xFF00FF88),
+                    fontWeight: FontWeight.bold,
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ),
           ],
         ),
       ),
@@ -708,21 +976,66 @@ class _CameraScreenState extends State<CameraScreen> {
     return Stack(
       children: _boundingBoxes.asMap().entries.map((entry) {
         final r = entry.value;
-        final cx = r.left + r.width / 2;
-        final cy = r.top + r.height / 2;
+        final labelSize = 24.0;
+        final labelLeft = (r.center.dx - labelSize / 2).clamp(
+          0.0,
+          math.max(0.0, _cameraAreaSize.width - labelSize),
+        );
+        final labelTop = (r.center.dy - labelSize / 2).clamp(
+          0.0,
+          math.max(0.0, _cameraAreaSize.height - labelSize),
+        );
         return Positioned(
-          left: cx - 14,
-          top: cy - 14,
-          child: Container(
-            width: 28, height: 28,
-            decoration: BoxDecoration(
-              color: const Color(0xFF00FF88),
-              shape: BoxShape.circle,
-              boxShadow: [BoxShadow(color: Colors.black54, blurRadius: 4, spreadRadius: 1)],
-            ),
-            child: Center(
-              child: Text('${entry.key + 1}',
-                style: const TextStyle(color: Colors.black, fontSize: 13, fontWeight: FontWeight.bold)),
+          left: r.left,
+          top: r.top,
+          child: SizedBox(
+            width: r.width,
+            height: r.height,
+            child: Stack(
+              clipBehavior: Clip.none,
+              children: [
+                Positioned.fill(
+                  child: Container(
+                    decoration: BoxDecoration(
+                      border: Border.all(
+                        color: const Color(0xFF00FF88),
+                        width: 2,
+                      ),
+                      color: const Color(0xFF00FF88).withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(4),
+                      boxShadow: const [
+                        BoxShadow(
+                          color: Colors.black54,
+                          blurRadius: 4,
+                          spreadRadius: 1,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                Positioned(
+                  left: labelLeft - r.left,
+                  top: labelTop - r.top,
+                  child: Container(
+                    width: labelSize,
+                    height: labelSize,
+                    decoration: const BoxDecoration(
+                      color: Color(0xFF00FF88),
+                      shape: BoxShape.circle,
+                    ),
+                    child: Center(
+                      child: Text(
+                        '${entry.key + 1}',
+                        style: const TextStyle(
+                          color: Colors.black,
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
         );
@@ -732,7 +1045,9 @@ class _CameraScreenState extends State<CameraScreen> {
 
   Widget _buildPromptInput() {
     return Positioned(
-      left: 0, right: 0, bottom: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
       child: Material(
         color: Colors.transparent,
         child: Container(
@@ -745,56 +1060,91 @@ class _CameraScreenState extends State<CameraScreen> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Row(children: [
-                const Icon(Icons.chat_bubble_outline, color: Color(0xFF00FF88), size: 14),
-                const SizedBox(width: 6),
-                const Expanded(
-                  child: Text('Προσθέστε οδηγία (προαιρετικό)',
-                    style: TextStyle(color: Color(0xFF00FF88), fontSize: 11, letterSpacing: 0.5)),
-                ),
-                GestureDetector(
-                  onTap: _cancelPrompt,
-                  child: const Icon(Icons.close, color: Colors.white38, size: 18),
-                ),
-              ]),
-              const SizedBox(height: 8),
-              Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Expanded(
-                  child: TextField(
-                    controller: _promptController,
-                    autofocus: true,
-                    style: const TextStyle(color: Colors.white, fontSize: 14),
-                    maxLines: 2,
-                    minLines: 1,
-                    textInputAction: TextInputAction.send,
-                    onSubmitted: (_) => _submitWithPrompt(),
-                    decoration: InputDecoration(
-                      hintText: 'π.χ. μέτρα μόνο τα κόκκινα…',
-                      hintStyle: const TextStyle(color: Colors.white24, fontSize: 13),
-                      filled: true,
-                      fillColor: const Color(0xFF1A1A2E),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide.none,
+              Row(
+                children: [
+                  const Icon(
+                    Icons.chat_bubble_outline,
+                    color: Color(0xFF00FF88),
+                    size: 14,
+                  ),
+                  const SizedBox(width: 6),
+                  const Expanded(
+                    child: Text(
+                      'Προσθέστε οδηγία (προαιρετικό)',
+                      style: TextStyle(
+                        color: Color(0xFF00FF88),
+                        fontSize: 11,
+                        letterSpacing: 0.5,
                       ),
-                      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                     ),
                   ),
-                ),
-                const SizedBox(width: 10),
-                GestureDetector(
-                  onTap: _submitWithPrompt,
-                  child: Container(
-                    width: 46, height: 46,
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF00FF88),
-                      shape: BoxShape.circle,
-                      boxShadow: [BoxShadow(color: const Color(0xFF00FF88).withAlpha(60), blurRadius: 8)],
+                  GestureDetector(
+                    onTap: _cancelPrompt,
+                    child: const Icon(
+                      Icons.close,
+                      color: Colors.white38,
+                      size: 18,
                     ),
-                    child: const Icon(Icons.send_rounded, color: Colors.black, size: 20),
                   ),
-                ),
-              ]),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _promptController,
+                      autofocus: true,
+                      style: const TextStyle(color: Colors.white, fontSize: 14),
+                      maxLines: 2,
+                      minLines: 1,
+                      textInputAction: TextInputAction.send,
+                      onSubmitted: (_) => _submitWithPrompt(),
+                      decoration: InputDecoration(
+                        hintText: 'π.χ. μέτρα μόνο τα κόκκινα…',
+                        hintStyle: const TextStyle(
+                          color: Colors.white24,
+                          fontSize: 13,
+                        ),
+                        filled: true,
+                        fillColor: const Color(0xFF1A1A2E),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide.none,
+                        ),
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  GestureDetector(
+                    onTap: _submitWithPrompt,
+                    child: Container(
+                      width: 46,
+                      height: 46,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF00FF88),
+                        shape: BoxShape.circle,
+                        boxShadow: [
+                          BoxShadow(
+                            color: const Color(0xFF00FF88).withAlpha(60),
+                            blurRadius: 8,
+                          ),
+                        ],
+                      ),
+                      child: const Icon(
+                        Icons.send_rounded,
+                        color: Colors.black,
+                        size: 20,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ],
           ),
         ),
@@ -807,11 +1157,14 @@ class _CameraScreenState extends State<CameraScreen> {
       left: _dotPosition!.dx - 4,
       top: _dotPosition!.dy - 4,
       child: Container(
-        width: 8, height: 8,
+        width: 8,
+        height: 8,
         decoration: const BoxDecoration(
           color: Color(0xFFFFD600),
           shape: BoxShape.circle,
-          boxShadow: [BoxShadow(color: Color(0xFFFFD600), blurRadius: 3, spreadRadius: 1)],
+          boxShadow: [
+            BoxShadow(color: Color(0xFFFFD600), blurRadius: 3, spreadRadius: 1),
+          ],
         ),
       ),
     );
@@ -820,7 +1173,9 @@ class _CameraScreenState extends State<CameraScreen> {
   Widget _buildZoomSlider() {
     if (_maxZoom <= 1.0) return const SizedBox.shrink();
     return Positioned(
-      right: 8, top: 20, bottom: 20,
+      right: 8,
+      top: 20,
+      bottom: 20,
       child: RotatedBox(
         quarterTurns: 3,
         child: Slider(
@@ -840,16 +1195,20 @@ class _CameraScreenState extends State<CameraScreen> {
 
   Widget _buildRipple() {
     return Positioned(
-      left: _tapPosition!.dx - 30, top: _tapPosition!.dy - 30,
+      left: _tapPosition!.dx - 30,
+      top: _tapPosition!.dy - 30,
       child: TweenAnimationBuilder<double>(
         tween: Tween(begin: 0, end: 1),
         duration: const Duration(milliseconds: 600),
         builder: (_, v, __) => Opacity(
           opacity: 1 - v,
           child: Container(
-            width: 60 + 60 * v, height: 60 + 60 * v,
-            decoration: BoxDecoration(shape: BoxShape.circle,
-              border: Border.all(color: const Color(0xFF00FF88), width: 2)),
+            width: 60 + 60 * v,
+            height: 60 + 60 * v,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              border: Border.all(color: const Color(0xFF00FF88), width: 2),
+            ),
           ),
         ),
       ),
@@ -858,7 +1217,9 @@ class _CameraScreenState extends State<CameraScreen> {
 
   Widget _buildIdentifyingIndicator() {
     return Positioned(
-      top: 20, left: 24, right: 24,
+      top: 20,
+      left: 24,
+      right: 24,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
         decoration: BoxDecoration(
@@ -866,19 +1227,34 @@ class _CameraScreenState extends State<CameraScreen> {
           borderRadius: BorderRadius.circular(24),
           border: Border.all(color: const Color(0xFF00FF88).withOpacity(0.5)),
         ),
-        child: const Row(mainAxisSize: MainAxisSize.min, mainAxisAlignment: MainAxisAlignment.center,
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00FF88))),
+            SizedBox(
+              width: 14,
+              height: 14,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: Color(0xFF00FF88),
+              ),
+            ),
             SizedBox(width: 10),
-            Text('Identifying...', style: TextStyle(color: Colors.white70, fontSize: 13)),
-          ]),
+            Text(
+              'Identifying...',
+              style: TextStyle(color: Colors.white70, fontSize: 13),
+            ),
+          ],
+        ),
       ),
     );
   }
 
   Widget _buildToast() {
     return Positioned(
-      top: 20, left: 24, right: 24,
+      top: 20,
+      left: 24,
+      right: 24,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
         decoration: BoxDecoration(
@@ -886,18 +1262,29 @@ class _CameraScreenState extends State<CameraScreen> {
           borderRadius: BorderRadius.circular(24),
           border: Border.all(color: const Color(0xFF00FF88).withOpacity(0.5)),
         ),
-        child: Row(mainAxisSize: MainAxisSize.min, mainAxisAlignment: MainAxisAlignment.center,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          mainAxisAlignment: MainAxisAlignment.center,
           children: [
             const Text('✅ ', style: TextStyle(fontSize: 14)),
-            Flexible(child: Text(_toastMsg, style: const TextStyle(color: Colors.white, fontSize: 13), textAlign: TextAlign.center)),
-          ]),
+            Flexible(
+              child: Text(
+                _toastMsg,
+                style: const TextStyle(color: Colors.white, fontSize: 13),
+                textAlign: TextAlign.center,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
 
   Widget _buildErrorCard() {
     return Positioned(
-      top: 20, left: 16, right: 16,
+      top: 20,
+      left: 16,
+      right: 16,
       child: GestureDetector(
         onTap: () => setState(() => _lastError = null),
         child: Container(
@@ -907,12 +1294,29 @@ class _CameraScreenState extends State<CameraScreen> {
             borderRadius: BorderRadius.circular(12),
             border: Border.all(color: Colors.redAccent),
           ),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text('ERROR (tap to dismiss)',
-              style: TextStyle(color: Colors.redAccent, fontSize: 11, letterSpacing: 1, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 6),
-            Text(_lastError ?? '', style: const TextStyle(color: Colors.white, fontSize: 12, height: 1.4)),
-          ]),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'ERROR (tap to dismiss)',
+                style: TextStyle(
+                  color: Colors.redAccent,
+                  fontSize: 11,
+                  letterSpacing: 1,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                _lastError ?? '',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  height: 1.4,
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
